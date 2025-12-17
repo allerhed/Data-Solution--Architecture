@@ -877,6 +877,198 @@ elseif ($Direction -eq "CommitToGit") {
 }
 ```
 
+### 7.3.1 Long Running Operations (LRO) Pattern
+
+Many Fabric Git integration APIs support asynchronous operations via the Long Running Operations (LRO) pattern. When an operation cannot complete immediately, the API returns `202 Accepted` with headers to poll for completion.
+
+**LRO Response Headers:**
+
+| Header | Description |
+|--------|-------------|
+| `Location` | URL to poll for operation status |
+| `x-ms-operation-id` | Unique operation tracking identifier |
+| `Retry-After` | Recommended polling interval in seconds |
+
+**Polling Pattern:**
+
+```powershell
+# scripts/fabric-api/poll-operation.ps1
+function Wait-FabricOperation {
+    param(
+        [Parameter(Mandatory=$true)][string]$LocationUrl,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [int]$MaxWaitSeconds = 300,
+        [int]$InitialRetryAfter = 5
+    )
+    
+    $headers = @{ "Authorization" = "Bearer $Token" }
+    $startTime = Get-Date
+    $retryAfter = $InitialRetryAfter
+    
+    Write-Host "Polling operation at: $LocationUrl"
+    
+    while (((Get-Date) - $startTime).TotalSeconds -lt $MaxWaitSeconds) {
+        Start-Sleep -Seconds $retryAfter
+        
+        try {
+            $response = Invoke-WebRequest -Uri $LocationUrl -Headers $headers -Method Get
+            
+            if ($response.StatusCode -eq 200) {
+                Write-Host "✅ Operation completed successfully"
+                return ($response.Content | ConvertFrom-Json)
+            }
+            elseif ($response.StatusCode -eq 202) {
+                Write-Host "⏳ Operation in progress..."
+                $retryAfter = [int]($response.Headers['Retry-After'] ?? $retryAfter)
+            }
+            else {
+                throw "Unexpected status code: $($response.StatusCode)"
+            }
+        }
+        catch {
+            Write-Error "Operation failed: $_"
+            throw
+        }
+    }
+    
+    throw "Operation timeout: exceeded $MaxWaitSeconds seconds"
+}
+
+# Usage example with updateFromGit (which may return 202)
+$token = (Get-AzAccessToken -ResourceUrl "https://api.fabric.microsoft.com").Token
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type"  = "application/json"
+}
+
+$body = @{
+    remoteCommitHash = "abc123def456"
+    conflictResolution = @{
+        conflictResolutionPolicy = "PreferRemote"
+    }
+} | ConvertTo-Json -Depth 3
+
+try {
+    $response = Invoke-WebRequest `
+        -Uri "https://api.fabric.microsoft.com/v1/workspaces/$workspaceId/git/updateFromGit" `
+        -Headers $headers `
+        -Method Post `
+        -Body $body
+    
+    if ($response.StatusCode -eq 202) {
+        # Long running operation - poll for completion
+        $locationUrl = $response.Headers['Location']
+        $result = Wait-FabricOperation -LocationUrl $locationUrl -Token $token
+        Write-Host "Sync completed: $($result | ConvertTo-Json)"
+    }
+    elseif ($response.StatusCode -eq 200) {
+        # Operation completed immediately
+        $result = $response.Content | ConvertFrom-Json
+        Write-Host "Sync completed immediately: $($result | ConvertTo-Json)"
+    }
+}
+catch {
+    Write-Error "Sync failed: $_"
+    exit 1
+}
+```
+
+**Python Implementation:**
+
+```python
+# scripts/fabric-api/poll_operation.py
+import time
+import requests
+from typing import Dict, Any
+
+def poll_fabric_operation(
+    location_url: str,
+    token: str,
+    max_wait_seconds: int = 300,
+    initial_retry_after: int = 5
+) -> Dict[str, Any]:
+    """Poll a Fabric LRO until completion.
+    
+    Args:
+        location_url: Operation status URL from Location header
+        token: Azure AD access token
+        max_wait_seconds: Maximum time to wait for operation
+        initial_retry_after: Initial polling interval in seconds
+    
+    Returns:
+        Operation result when completed
+    
+    Raises:
+        TimeoutError: If operation doesn't complete within max_wait_seconds
+        Exception: If operation fails
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    start_time = time.time()
+    retry_after = initial_retry_after
+    
+    print(f"Polling operation at: {location_url}")
+    
+    while time.time() - start_time < max_wait_seconds:
+        time.sleep(retry_after)
+        
+        response = requests.get(location_url, headers=headers)
+        
+        if response.status_code == 200:
+            print("✅ Operation completed successfully")
+            return response.json()
+        
+        elif response.status_code == 202:
+            print("⏳ Operation in progress...")
+            retry_after = int(response.headers.get('Retry-After', retry_after))
+        
+        else:
+            raise Exception(
+                f"Operation failed: {response.status_code} - {response.text}"
+            )
+    
+    raise TimeoutError(
+        f"Operation timeout: exceeded {max_wait_seconds} seconds"
+    )
+
+# Usage example
+from azure.identity import DefaultAzureCredential
+
+credential = DefaultAzureCredential()
+token = credential.get_token("https://api.fabric.microsoft.com/.default").token
+
+response = requests.post(
+    f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/git/updateFromGit",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    },
+    json={
+        "remoteCommitHash": "abc123def456",
+        "conflictResolution": {
+            "conflictResolutionPolicy": "PreferRemote"
+        }
+    }
+)
+
+if response.status_code == 202:
+    # Long running operation - poll for completion
+    location_url = response.headers['Location']
+    result = poll_fabric_operation(location_url, token)
+    print(f"Sync completed: {result}")
+elif response.status_code == 200:
+    # Operation completed immediately
+    print(f"Sync completed immediately: {response.json()}")
+else:
+    raise Exception(f"Sync failed: {response.status_code} - {response.text}")
+```
+
+**Key Points:**
+- Always check for `202 Accepted` responses from Fabric Git APIs
+- Use the `Location` header URL to poll operation status
+- Respect the `Retry-After` header to avoid excessive polling
+- Implement exponential backoff or fixed intervals based on `Retry-After`
+- Set appropriate timeouts (recommended: 5-10 minutes for Git operations)
+
 ### 7.4 Get Sync Status
 
 ```powershell
@@ -1123,25 +1315,78 @@ flowchart TB
     PBI_SYNC --> DBX
 ```
 
-### 9.2 Required GitHub Secrets
+### 9.2 GitHub Actions OIDC Authentication
 
-| Secret | Description |
-|--------|-------------|
-| `AZURE_CLIENT_ID` | Service principal application ID |
-| `AZURE_CLIENT_SECRET` | Service principal secret |
-| `AZURE_TENANT_ID` | Azure AD tenant ID |
-| `AZURE_SUBSCRIPTION_ID` | Target Azure subscription |
-| `DATABRICKS_HOST` | Databricks workspace URL |
-| `DATABRICKS_TOKEN` | Databricks PAT or service principal token |
+GitHub Actions uses **OpenID Connect (OIDC)** to authenticate to Azure without storing long-lived secrets. This approach uses federated identity credentials configured on the Azure service principal to trust GitHub Actions tokens.
 
-### 9.3 Required GitHub Variables
+#### 9.2.1 Federated Credential Setup
+
+**Prerequisites:**
+1. Azure service principal (application registration)
+2. RBAC roles assigned (Contributor on resource group/subscription)
+
+**Create Federated Credentials:**
+
+```bash
+# Create federated credential for main branch deployments
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "github-main-branch",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:org/repo-name:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+
+# Create federated credential for pull request validation
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "github-pull-requests",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:org/repo-name:pull_request",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+
+# Create federated credential for production environment
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "github-prod-environment",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:org/repo-name:environment:production",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+**Subject Patterns:**
+- Branch deployments: `repo:org/repo-name:ref:refs/heads/<branch-name>`
+- Pull requests: `repo:org/repo-name:pull_request`
+- Environment deployments: `repo:org/repo-name:environment:<environment-name>`
+- Tagged releases: `repo:org/repo-name:ref:refs/tags/<tag-name>`
+
+### 9.3 Required GitHub Variables and Secrets
+
+#### GitHub Variables (Public - No Sensitive Data)
 
 | Variable | Description |
 |----------|-------------|
+| `AZURE_CLIENT_ID` | Service principal application (client) ID |
+| `AZURE_TENANT_ID` | Azure AD tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Target Azure subscription ID |
 | `DEV_WORKSPACE_ID` | Fabric DEV workspace GUID |
 | `UAT_WORKSPACE_ID` | Fabric UAT workspace GUID |
 | `PROD_WORKSPACE_ID` | Fabric PROD workspace GUID |
 | `DEPLOYMENT_PIPELINE_ID` | Fabric deployment pipeline GUID |
+
+#### GitHub Secrets (Sensitive Data Only)
+
+| Secret | Description | Required For |
+|--------|-------------|-------------|
+| `DATABRICKS_HOST` | Databricks workspace URL | Power BI sync jobs |
+| `DATABRICKS_TOKEN` | Databricks service principal token or PAT | Power BI sync jobs |
+
+**Note:** With OIDC authentication, `AZURE_CLIENT_SECRET` is **NOT required**. GitHub Actions receives a short-lived token from GitHub's OIDC provider, which Azure trusts via the federated credential configuration.
 
 ### 9.4 Terraform Plan Workflow
 
@@ -1164,6 +1409,10 @@ jobs:
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write      # Required for OIDC authentication
+      contents: read       # Required to checkout repository
+      pull-requests: write # Required to comment on PRs
     
     steps:
       - name: Checkout
@@ -1174,16 +1423,12 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Azure Login
+      - name: Azure Login (OIDC)
         uses: azure/login@v1
         with:
-          creds: |
-            {
-              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
-              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
-            }
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Terraform Init
         working-directory: ${{ env.WORKING_DIR }}
@@ -1241,6 +1486,8 @@ on:
 jobs:
   determine-environment:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       environment: ${{ steps.set-env.outputs.environment }}
       workspace_id: ${{ steps.set-env.outputs.workspace_id }}
@@ -1270,21 +1517,20 @@ jobs:
     needs: determine-environment
     runs-on: ubuntu-latest
     environment: ${{ needs.determine-environment.outputs.environment }}
+    permissions:
+      id-token: write  # Required for OIDC authentication
+      contents: read   # Required to checkout repository
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure Login (OIDC)
         uses: azure/login@v1
         with:
-          creds: |
-            {
-              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
-              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
-            }
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sync Workspace from Git
         shell: pwsh
@@ -1900,6 +2146,20 @@ ALTER TABLE governance.powerbi_metadata.measures
 SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
 ```
 
+## Instead of exporting semantic model definitions, you can use **OneLake shortcuts** to create direct references to Databricks Unity Catalog tables in Fabric:
+
+```python
+# Use Fabric Notebook to create shortcut to UC table
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.build()
+
+# Create shortcut (Fabric handles this automatically when configured)
+df = spark.sql("SELECT * FROM catalog.schema.table")  # Databricks UC table
+df.write.mode("overwrite").save(
+    "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/Files/shortcuts/uc_table"
+)
+
 ---
 
 ## 11.5 Orchestration Recommendation
@@ -2008,78 +2268,9 @@ datasets:
 
 ---
 
-## 13. Multi-Tenant Architecture Considerations
+## 13. Unit Testing Framework
 
-### 13.1 Workspace-per-Tenant Model
-
-For ISV or multi-tenant scenarios, implement workspace isolation:
-
-```mermaid
-flowchart TB
-    subgraph SHARED["Shared Resources"]
-        TEMPLATE["📋 Template Workspace<br/>(Git main branch)"]
-        SHARED_DATA["📦 Shared Data Workspace<br/>(Reference data)"]
-    end
-
-    subgraph TENANTS["Tenant Workspaces"]
-        T1["🏢 Tenant-A Workspace"]
-        T2["🏢 Tenant-B Workspace"]
-        T3["🏢 Tenant-C Workspace"]
-    end
-
-    subgraph ISOLATION["Data Isolation"]
-        T1_DATA["Tenant-A Data"]
-        T2_DATA["Tenant-B Data"]
-        T3_DATA["Tenant-C Data"]
-    end
-
-    TEMPLATE --> |"Clone via API"| T1
-    TEMPLATE --> |"Clone via API"| T2
-    TEMPLATE --> |"Clone via API"| T3
-    
-    SHARED_DATA --> |"Shortcut"| T1
-    SHARED_DATA --> |"Shortcut"| T2
-    SHARED_DATA --> |"Shortcut"| T3
-
-    T1 --> T1_DATA
-    T2 --> T2_DATA
-    T3 --> T3_DATA
-```
-
-### 13.2 Multi-Tenant Benefits
-
-| Feature | Benefit |
-|---------|---------|
-| **Physical Data Isolation** | Each tenant's data in separate workspace/lakehouse |
-| **Granular Permissions** | RBAC per workspace ensures tenant isolation |
-| **Chargeback Support** | Separate capacities enable per-tenant cost tracking |
-| **Canary Deployments** | Individual workspaces can connect to different branches |
-| **Shared Data via Shortcuts** | Common reference data without duplication |
-| **Regional Compliance** | Capacities can be deployed per region |
-
-### 13.3 Cross-Workspace Queries
-
-For ISV-level reporting across tenants (use with caution):
-
-```yaml
-# Cross-workspace query configuration
-cross_workspace:
-  enabled: true
-  method: "SQL Analytics Endpoint + Shortcuts"
-  use_cases:
-    - "ISV aggregate reporting"
-    - "Cross-tenant analytics"
-  security:
-    - "Dedicated reporting workspace"
-    - "Read-only shortcuts"
-    - "No tenant PII exposure"
-```
-
----
-
-## 14. Unit Testing Framework
-
-### 14.1 Data Factory Testing Framework
+### 13.1 Data Factory Testing Framework
 
 Microsoft provides a standalone test framework for validating Fabric pipelines:
 
@@ -2111,7 +2302,7 @@ flowchart LR
     RUNNER --> PIPE
 ```
 
-### 14.2 Test Examples
+### 13.2 Test Examples
 
 ```python
 # tests/unit/test_pipelines.py
@@ -2164,9 +2355,9 @@ def test_pipeline_execution_flow():
 
 ---
 
-## 15. Deployment Guide
+## 14. Deployment Guide
 
-### 15.1 Prerequisites
+### 14.1 Prerequisites
 
 | Requirement | Details |
 |-------------|---------|
@@ -2178,7 +2369,7 @@ def test_pipeline_execution_flow():
 | Power BI license | Pro or Premium Per User |
 | Azure AD permissions | Create service principals and groups |
 
-### 15.2 Initial Setup Steps
+### 14.2 Initial Setup Steps
 
 ```bash
 # 1. Clone template repository
@@ -2220,7 +2411,7 @@ git commit -m "Initial configuration"
 git push origin main
 ```
 
-### 15.3 Post-Deployment Verification
+### 14.3 Post-Deployment Verification
 
 ```bash
 # Verify Terraform deployment
@@ -2284,6 +2475,9 @@ pwsh scripts/fabric-api/get-status.ps1 -WorkspaceId "<workspace-id>" -IncludeIte
 - [Databricks Unity Catalog](https://docs.databricks.com/data-governance/unity-catalog/index.html)
 
 ---
+
+### F. Document Information
+-[Document is best viewd with Markdown Preview Mermaid Support extension installed in VSCode]-
 
 *Document Version: 2.0 FINAL | December 2025*  
 *Aligned with Microsoft Fabric GitOps Best Practices*
