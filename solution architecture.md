@@ -542,6 +542,14 @@ flowchart TB
     MERGE2 --> RESOLVED
     RESOLVE3 --> |"Push & sync"| RESOLVED
 ```
+### 5.5 Capacity Planning for Ring Deployments
+
+When assigning workspaces to pipeline stages:
+- **DEV workspace** → F2 or F4 SKU (development/iteration)
+- **UAT workspace** → F4 or F8 SKU (testing with production-like data)
+- **PROD workspace** → F8+ SKU (depends on concurrent users and query complexity)
+
+Separate capacities avoid resource contention during testing and ensure production SLAs.
 
 ---
 
@@ -1557,53 +1565,122 @@ flowchart LR
 | **C: XMLA Endpoint (DMV/TMSL)** | `pyadomd`/TOM via XMLA to export full model (DMVs) | Full semantic fidelity (measures, relationships, roles, partitions) | Requires Premium/Fabric capacity; gateway if private |
 | **D: Fabric REST TMDL** | `POST /workspaces/{id}/semanticModels/{id}/getDefinition` (format `tmdl`) | Structured model definition; aligns with Fabric APIs | Coverage still evolving; transform to UC schema needed |
 
-### 11.3 Recommended Implementation (Approach A)
+### 11.3 Recommended Implementation (Approach D: Fabric REST TMDL)
+
+Extracts the complete TMDL (Tabular Model Definition Language) representation via Fabric REST API—aligned with Fabric's native APIs and future-proof for governance.
 
 ```python
-# powerbi/sync/extract-semantic-model.py
+# powerbi/sync/extract-semantic-model-fabric-rest.py
 import os
+import requests
 import json
-from pyadomd import Pyadomd
+from datetime import datetime
 
-def extract_model(workspace_id: str, dataset_id: str) -> dict:
-    """Extract semantic model metadata via XMLA endpoint."""
+FABRIC_API = "https://api.fabric.microsoft.com/v1"
+TENANT_ID = os.environ.get("AZURE_TENANT_ID")
+CLIENT_ID = os.environ.get("AZURE_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET")
+
+def get_fabric_token():
+    """Acquire Azure AD token for Fabric API"""
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://api.fabric.microsoft.com/.default"
+    }
+    response = requests.post(url, data=payload)
+    return response.json()["access_token"]
+
+def extract_semantic_model(workspace_id: str, semantic_model_id: str) -> dict:
+    """Extract semantic model definition via Fabric REST API (TMDL format)."""
     
-    conn_str = (
-        f"Provider=MSOLAP;"
-        f"Data Source=powerbi://api.powerbi.com/v1.0/myorg/{workspace_id};"
-        f"Initial Catalog={dataset_id};"
-        f"User ID=app:{os.environ['AZURE_CLIENT_ID']}@{os.environ['AZURE_TENANT_ID']};"
-        f"Password={os.environ['AZURE_CLIENT_SECRET']}"
+    token = get_fabric_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Get semantic model definition in TMDL format
+    url = (
+        f"{FABRIC_API}/workspaces/{workspace_id}/"
+        f"semanticModels/{semantic_model_id}/getDefinition"
     )
     
-    model = {"measures": [], "dimensions": [], "relationships": []}
+    payload = {"format": "tmdl"}
     
-    with Pyadomd(conn_str) as conn:
-        cursor = conn.cursor()
-        
-        # Extract measures
-        cursor.execute("""
-            SELECT MEASURE_NAME, MEASURE_CAPTION, EXPRESSION, MEASUREGROUP_NAME
-            FROM $SYSTEM.MDSCHEMA_MEASURES
-            WHERE MEASURE_IS_VISIBLE = true
-        """)
-        for row in cursor.fetchall():
-            model["measures"].append({
-                "name": row[0], "caption": row[1],
-                "expression": row[2], "table": row[3]
-            })
-        
-        # Extract dimensions
-        cursor.execute("""
-            SELECT DIMENSION_NAME, DIMENSION_CAPTION, DIMENSION_TYPE
-            FROM $SYSTEM.MDSCHEMA_DIMENSIONS
-        """)
-        for row in cursor.fetchall():
-            model["dimensions"].append({
-                "name": row[0], "caption": row[1], "type": row[2]
-            })
+    response = requests.post(url, headers=headers, json=payload)
     
-    return model
+    if response.status_code != 200:
+        raise Exception(f"Failed to extract model: {response.status_code} {response.text}")
+    
+    definition = response.json()
+    
+    return {
+        "semantic_model_id": semantic_model_id,
+        "workspace_id": workspace_id,
+        "definition": definition,
+        "extraction_timestamp": datetime.utcnow().isoformat()
+    }
+
+def parse_tmdl_definition(definition: dict) -> dict:
+    """Parse TMDL definition into structured metadata."""
+    
+    parsed = {
+        "measures": [],
+        "tables": [],
+        "relationships": [],
+        "roles": []
+    }
+    
+    # Extract tables and their measures
+    for table in definition.get("tables", []):
+        table_record = {
+            "name": table.get("name"),
+            "displayName": table.get("displayName"),
+            "isHidden": table.get("isHidden", False),
+            "source": table.get("source")
+        }
+        parsed["tables"].append(table_record)
+        
+        # Extract measures from table
+        for measure in table.get("measures", []):
+            measure_record = {
+                "table": table.get("name"),
+                "name": measure.get("name"),
+                "displayName": measure.get("displayName"),
+                "expression": measure.get("expression"),
+                "dataType": measure.get("dataType"),
+                "formatString": measure.get("formatString"),
+                "isHidden": measure.get("isHidden", False),
+                "description": measure.get("description")
+            }
+            parsed["measures"].append(measure_record)
+    
+    # Extract relationships
+    for relationship in definition.get("relationships", []):
+        rel_record = {
+            "name": relationship.get("name"),
+            "fromTable": relationship.get("fromTable"),
+            "fromColumn": relationship.get("fromColumn"),
+            "toTable": relationship.get("toTable"),
+            "toColumn": relationship.get("toColumn"),
+            "type": relationship.get("type"),
+            "crossFilteringBehavior": relationship.get("crossFilteringBehavior")
+        }
+        parsed["relationships"].append(rel_record)
+    
+    # Extract roles (RLS)
+    for role in definition.get("roles", []):
+        role_record = {
+            "name": role.get("name"),
+            "modelPermission": role.get("modelPermission"),
+            "tablePermissions": role.get("tablePermissions", [])
+        }
+        parsed["roles"].append(role_record)
+    
+    return parsed
 ```
 
 ```python
@@ -1611,8 +1688,9 @@ def extract_model(workspace_id: str, dataset_id: str) -> dict:
 import os
 import json
 from databricks.sdk import WorkspaceClient
+from datetime import datetime
 
-def sync_to_uc(model: dict, catalog: str, schema: str):
+def sync_to_uc(model_metadata: dict, catalog: str, schema: str):
     """Write semantic model definitions to Unity Catalog."""
     
     client = WorkspaceClient(
@@ -1620,26 +1698,116 @@ def sync_to_uc(model: dict, catalog: str, schema: str):
         token=os.environ["DATABRICKS_TOKEN"]
     )
     
-    for measure in model["measures"]:
-        # Create/update metric in UC
-        client.api_client.do("POST", "/api/2.1/unity-catalog/metrics", body={
-            "name": f"{measure['table']}_{measure['name']}",
-            "catalog_name": catalog,
-            "schema_name": schema,
-            "definition": {
-                "type": "MEASURE",
-                "expression": measure["expression"],
-                "description": measure["caption"],
-                "source_system": "PowerBI"
-            }
-        })
+    semantic_model_id = model_metadata["semantic_model_id"]
+    parsed_definition = model_metadata["parsed_definition"]
+    extraction_timestamp = model_metadata["extraction_timestamp"]
+    
+    # Write semantic model metadata
+    model_record = {
+        "semantic_model_id": semantic_model_id,
+        "definition_json": json.dumps(model_metadata["definition"]),
+        "extraction_timestamp": extraction_timestamp,
+        "extraction_method": "Fabric REST TMDL"
+    }
+    
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.build()
+    
+    # Write model definition
+    spark.createDataFrame([model_record]).write \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .saveAsTable(f"{catalog}.{schema}.semantic_model_definitions")
+    
+    # Write tables
+    for table in parsed_definition["tables"]:
+        table["semantic_model_id"] = semantic_model_id
+        table["extraction_timestamp"] = extraction_timestamp
+    
+    spark.createDataFrame(parsed_definition["tables"]).write \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .saveAsTable(f"{catalog}.{schema}.semantic_model_tables")
+    
+    # Write measures
+    for measure in parsed_definition["measures"]:
+        measure["semantic_model_id"] = semantic_model_id
+        measure["extraction_timestamp"] = extraction_timestamp
+    
+    spark.createDataFrame(parsed_definition["measures"]).write \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .saveAsTable(f"{catalog}.{schema}.semantic_model_measures")
+    
+    # Write relationships
+    for relationship in parsed_definition["relationships"]:
+        relationship["semantic_model_id"] = semantic_model_id
+        relationship["extraction_timestamp"] = extraction_timestamp
+    
+    spark.createDataFrame(parsed_definition["relationships"]).write \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .saveAsTable(f"{catalog}.{schema}.semantic_model_relationships")
+    
+    # Write roles (for RLS governance)
+    for role in parsed_definition["roles"]:
+        role["semantic_model_id"] = semantic_model_id
+        role["extraction_timestamp"] = extraction_timestamp
+    
+    spark.createDataFrame(parsed_definition["roles"]).write \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .saveAsTable(f"{catalog}.{schema}.semantic_model_roles")
+    
+    print(f"✅ Semantic model {semantic_model_id} synchronized to {catalog}.{schema}")
 ```
 
-Fabric REST API for Semantic Model Definition
+### 11.3.1 Why Fabric REST TMDL (Approach D)?
 
-Extracts the complete TMDL (Tabular Model Definition Language) representation.
+- **Future-proof:** Aligns with Fabric's native API strategy
+- **Structured format:** TMDL is version-controlled and parseable
+- **Complete coverage:** Captures tables, measures, relationships, roles, and metadata
+- **No external dependencies:** Works directly with Fabric API (no Premium capacity requirement)
+- **Governance-ready:** Roles and RLS definitions included for security auditing
 
-```python
+### 11.3.2 Integration with GitHub Actions
+
+```yaml
+# .github/workflows/powerbi-sync.yml
+name: Semantic Model Sync to Databricks
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install requests databricks-sdk pyspark
+      
+      - name: Extract and sync semantic models
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          FABRIC_WORKSPACE_ID: ${{ secrets.FABRIC_WORKSPACE_ID }}
+          FABRIC_SEMANTIC_MODEL_ID: ${{ secrets.FABRIC_SEMANTIC_MODEL_ID }}
+        run: |
+          python powerbi/sync/extract-semantic-model-fabric-rest.py
+```
 import requests
 import json
 
